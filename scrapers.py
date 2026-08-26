@@ -13,6 +13,12 @@ como comparador de preços, sua página de busca lista vários produtos na
 mesma página, então em vez de pegar "o primeiro preço da página" é preciso
 achar o card cujo nome bate com o modelo procurado antes de extrair o preço.
 
+O Buscapé usa uma quarta estratégia (coletar_preco_buscape): também é um
+comparador de preços, mas a própria página de produto já expõe um JSON-LD
+(schema.org/Product, dentro de um bloco "@graph") com o preço agregado —
+`offers.lowPrice` é o menor preço entre as lojas que o Buscapé compara para
+aquele anúncio. Não precisa de página de busca nem de casar nome de card.
+
 Sobre a Pichau: não está entre as lojas ativas. Ela bloqueia requisições
 automatizadas com um desafio Cloudflare (HTTP 403), então nenhuma
 estratégia de extração aqui resolve — não é um problema de seletor.
@@ -43,13 +49,15 @@ HEADERS = {
 
 DEBUG_DIR = Path(__file__).parent / "data" / "debug_html"
 
-# Chaves de GPU_MODELOS raspadas via coletar_preco() (JSON-LD/regex de uma
-# página de produto única) dentro de coletar_todos(). "promotech_url" fica
-# de fora de propósito — é só um link de referência para conferência manual;
-# a coleta automática do Promotech usa promotech_busca_url/_termo, que segue
-# um caminho de extração diferente (ver coletar_preco_promotech_busca).
-# "pichau_url" também fica de fora: o site bloqueia scraping com um desafio
-# Cloudflare (ver nota no topo do arquivo).
+# Chaves de PRODUTOS_MODELOS raspadas via coletar_preco() (JSON-LD/regex de
+# uma página de produto única) dentro de coletar_todos(). "promotech_url"
+# fica de fora de propósito — é só um link de referência para conferência
+# manual; a coleta automática do Promotech usa promotech_busca_url/_termo,
+# que segue um caminho de extração diferente (ver
+# coletar_preco_promotech_busca). "buscape_url" também fica de fora: segue
+# seu próprio caminho de extração (ver coletar_preco_buscape). "pichau_url"
+# também fica de fora: o site bloqueia scraping com um desafio Cloudflare
+# (ver nota no topo do arquivo).
 LOJAS_ATIVAS = ("kabum_url", "terabyte_url")
 
 
@@ -110,6 +118,32 @@ def _extrair_via_busca_promotech(soup, termo_esperado):
         texto = tag.get_text(" ", strip=True)
         if texto.lower().startswith(termo_norm):
             return _preco_para_float(texto), texto
+    return None, None
+
+
+def _extrair_via_jsonld_buscape(soup):
+    """
+    Procura, no JSON-LD do Buscapé (schema.org/Product dentro de um bloco
+    "@graph"), o preço agregado mínimo (offers.lowPrice) entre as lojas que
+    o Buscapé compara para aquele anúncio.
+    """
+    for tag in soup.find_all("script", {"type": "application/ld+json"}):
+        try:
+            data = json.loads(tag.string or "")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        grafo = data.get("@graph") if isinstance(data, dict) else None
+        if not grafo:
+            continue
+        for item in grafo:
+            if not isinstance(item, dict) or item.get("@type") != "Product":
+                continue
+            oferta = item.get("offers")
+            if isinstance(oferta, dict) and oferta.get("lowPrice"):
+                try:
+                    return float(oferta["lowPrice"]), item.get("name")
+                except (TypeError, ValueError):
+                    continue
     return None, None
 
 
@@ -192,14 +226,50 @@ def coletar_preco_promotech_busca(url_busca, termo_esperado, modelo, debug=False
     }
 
 
-def coletar_todos(gpu_modelos, pausa_min=2, pausa_max=5, debug=False):
+def coletar_preco_buscape(url, modelo, debug=False):
     """
-    Percorre todos os modelos/lojas definidos em config.GPU_MODELOS e
+    Busca o menor preço agregado de um produto no Buscapé (comparador de
+    preços), via o JSON-LD que a própria página de produto já expõe
+    (offers.lowPrice, ver _extrair_via_jsonld_buscape). Diferente do
+    Promotech, não precisa de página de busca separada.
+    Retorna um dict pronto para virar linha no CSV, ou None se falhar.
+    """
+    loja = "Buscapé (menor preço)"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"[{loja}] Falha ao acessar {url}: {e}")
+        return None
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    preco, titulo = _extrair_via_jsonld_buscape(soup)
+
+    if preco is None:
+        print(f"[{loja}] Não foi possível extrair o preço de {url}.")
+        if debug:
+            caminho = _salvar_debug_html(f"Buscape_{modelo}".replace(" ", "_"), resp.text)
+            print(f"  HTML salvo em: {caminho} — confira a estrutura para ajustar o seletor.")
+        return None
+
+    return {
+        "data_hora": datetime.now().isoformat(timespec="seconds"),
+        "loja": loja,
+        "modelo": modelo,
+        "preco": preco,
+        "titulo_produto": titulo or "",
+        "url": url,
+    }
+
+
+def coletar_todos(produtos_modelos, pausa_min=2, pausa_max=5, debug=False):
+    """
+    Percorre todos os modelos/lojas definidos em config.PRODUTOS_MODELOS e
     retorna uma lista de registros coletados com sucesso. Pausa entre
     requisições para não sobrecarregar os sites.
     """
     registros = []
-    for modelo, info in gpu_modelos.items():
+    for modelo, info in produtos_modelos.items():
         for chave, url in info.items():
             if chave not in LOJAS_ATIVAS or not url:
                 continue
@@ -214,6 +284,14 @@ def coletar_todos(gpu_modelos, pausa_min=2, pausa_max=5, debug=False):
         termo_busca = info.get("promotech_busca_termo")
         if url_busca and termo_busca:
             registro = coletar_preco_promotech_busca(url_busca, termo_busca, modelo, debug=debug)
+            if registro:
+                registros.append(registro)
+                print(f"[OK] {modelo} — {registro['loja']}: R$ {registro['preco']:.2f}")
+            time.sleep(random.uniform(pausa_min, pausa_max))
+
+        url_buscape = info.get("buscape_url")
+        if url_buscape:
+            registro = coletar_preco_buscape(url_buscape, modelo, debug=debug)
             if registro:
                 registros.append(registro)
                 print(f"[OK] {modelo} — {registro['loja']}: R$ {registro['preco']:.2f}")
