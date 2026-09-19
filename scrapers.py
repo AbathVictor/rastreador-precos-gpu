@@ -8,20 +8,29 @@ Estratégia de extração, em ordem de preferência (Kabum e Terabyte):
    do que depender de classes CSS específicas do front-end.
 2. Fallback: procurar o primeiro valor "R$ X.XXX,XX" no texto da página.
 
-O Promotech usa uma terceira estratégia (coletar_preco_promotech_busca):
-como comparador de preços, sua página de busca lista vários produtos na
-mesma página, então em vez de pegar "o primeiro preço da página" é preciso
-achar o card cujo nome bate com o modelo procurado antes de extrair o preço.
-
-O Buscapé usa uma quarta estratégia (coletar_preco_buscape): também é um
-comparador de preços, mas a própria página de produto já expõe um JSON-LD
-(schema.org/Product, dentro de um bloco "@graph") com o preço agregado —
-`offers.lowPrice` é o menor preço entre as lojas que o Buscapé compara para
-aquele anúncio. Não precisa de página de busca nem de casar nome de card.
+O Buscapé é usado de duas formas (ambas via coletar_preco_buscape /
+coletar_preco_buscape_busca):
+1. Página de produto (PS5): já expõe um JSON-LD (schema.org/Product, dentro
+   de um bloco "@graph") com o preço agregado — `offers.lowPrice` é o menor
+   preço entre as lojas que o Buscapé compara para aquele anúncio. Não
+   precisa de página de busca nem de casar nome de anúncio.
+2. Página de busca (GPUs): os resultados vêm embutidos como JSON dentro de
+   um <script id="__NEXT_DATA__"> (cada item com "name" e "price"), então
+   em vez de casar texto de card feito na marra em HTML, filtra-se essa
+   lista por palavras (ver _extrair_via_busca_buscape) e usa-se o menor
+   preço entre os itens que baterem. Essa é a estratégia que substituiu o
+   Promotech (ver nota abaixo).
 
 Sobre a Pichau: não está entre as lojas ativas. Ela bloqueia requisições
 automatizadas com um desafio Cloudflare (HTTP 403), então nenhuma
 estratégia de extração aqui resolve — não é um problema de seletor.
+
+Sobre o Promotech: até meados de setembro/2026 alimentava a coleta das GPUs
+via página de busca (card-matching em HTML). Desde então o site bloqueia
+toda e qualquer requisição automatizada (inclusive a home) com um "Vercel
+Security Checkpoint" (HTTP 429, header `X-Vercel-Mitigated: challenge`),
+igual à Pichau — não há seletor para ajustar, o HTML real nunca chega a ser
+servido. Foi substituído pela busca via Buscapé (ver item 2 acima).
 
 Importante: nenhum scraper de e-commerce é 100% à prova de mudanças de
 layout. Se uma loja redesenhar o site, a função correspondente pode parar
@@ -52,12 +61,11 @@ DEBUG_DIR = Path(__file__).parent / "data" / "debug_html"
 # Chaves de PRODUTOS_MODELOS raspadas via coletar_preco() (JSON-LD/regex de
 # uma página de produto única) dentro de coletar_todos(). "promotech_url"
 # fica de fora de propósito — é só um link de referência para conferência
-# manual; a coleta automática do Promotech usa promotech_busca_url/_termo,
-# que segue um caminho de extração diferente (ver
-# coletar_preco_promotech_busca). "buscape_url" também fica de fora: segue
-# seu próprio caminho de extração (ver coletar_preco_buscape). "pichau_url"
-# também fica de fora: o site bloqueia scraping com um desafio Cloudflare
-# (ver nota no topo do arquivo).
+# manual (site bloqueado para scraping, ver nota no topo do arquivo).
+# "buscape_url" e "buscape_busca_url" também ficam de fora: seguem seus
+# próprios caminhos de extração (ver coletar_preco_buscape e
+# coletar_preco_buscape_busca). "pichau_url" também fica de fora: o site
+# bloqueia scraping com um desafio Cloudflare (ver nota no topo do arquivo).
 LOJAS_ATIVAS = ("kabum_url", "terabyte_url")
 
 
@@ -105,20 +113,55 @@ def _extrair_via_regex(soup):
     return preco, titulo
 
 
-def _extrair_via_busca_promotech(soup, termo_esperado):
+def _contem_todas_palavras(texto_norm, palavras):
+    return all(re.search(rf"\b{re.escape(p)}\b", texto_norm) for p in palavras)
+
+
+def _contem_alguma_palavra(texto_norm, palavras):
+    return any(re.search(rf"\b{re.escape(p)}\b", texto_norm) for p in palavras)
+
+
+def _extrair_via_busca_buscape(soup, termo_esperado, excluir_termos=()):
     """
-    Procura, nos resultados de busca do Promotech, o card cujo nome começa
-    com `termo_esperado` e extrai o preço à vista listado nele. Retorna
-    (None, None) se o produto não aparecer na busca ou estiver indisponível
-    ("Produto indisponível" não tem "R$", então _preco_para_float já
-    retorna None nesse caso).
+    Procura, nos resultados de busca do Buscapé (embutidos como JSON dentro
+    de <script id="__NEXT_DATA__">, em props.initialReduxState.hits.hits —
+    cada item com "name" e "price"), o menor preço entre os itens cujo nome
+    contém todas as palavras de `termo_esperado` (por palavra inteira, não
+    por posição — o texto do anúncio varia de loja pra loja) e nenhuma das
+    palavras de `excluir_termos` (ex.: "ti", pra não misturar RTX 5070 Ti
+    nos resultados da RTX 5070 comum). Retorna (None, None) se nada bater.
     """
-    termo_norm = termo_esperado.strip().lower()
-    for tag in soup.find_all("a", href=re.compile(r"/produtos/")):
-        texto = tag.get_text(" ", strip=True)
-        if texto.lower().startswith(termo_norm):
-            return _preco_para_float(texto), texto
-    return None, None
+    tag = soup.find("script", id="__NEXT_DATA__")
+    if not tag or not tag.string:
+        return None, None
+    try:
+        data = json.loads(tag.string)
+    except json.JSONDecodeError:
+        return None, None
+
+    hits = (
+        data.get("props", {})
+        .get("initialReduxState", {})
+        .get("hits", {})
+        .get("hits", [])
+    )
+    palavras_incluir = termo_esperado.strip().lower().split()
+    palavras_excluir = [t.lower() for t in excluir_termos]
+
+    melhor_preco, melhor_nome = None, None
+    for hit in hits:
+        nome = hit.get("name") or ""
+        nome_norm = nome.lower()
+        if not _contem_todas_palavras(nome_norm, palavras_incluir):
+            continue
+        if palavras_excluir and _contem_alguma_palavra(nome_norm, palavras_excluir):
+            continue
+        preco = hit.get("price")
+        if not isinstance(preco, (int, float)):
+            continue
+        if melhor_preco is None or preco < melhor_preco:
+            melhor_preco, melhor_nome = preco, nome
+    return melhor_preco, melhor_nome
 
 
 def _extrair_via_jsonld_buscape(soup):
@@ -189,15 +232,16 @@ def coletar_preco(url, loja, modelo, debug=False):
     }
 
 
-def coletar_preco_promotech_busca(url_busca, termo_esperado, modelo, debug=False):
+def coletar_preco_buscape_busca(url_busca, termo_esperado, modelo, excluir_termos=(), debug=False):
     """
-    Busca `termo_esperado` na página de busca do Promotech (comparador de
-    preços) e extrai o menor preço à vista encontrado ali para esse produto.
-    Diferente de coletar_preco(), a página tem vários produtos, então
-    primeiro é preciso achar o card certo (ver _extrair_via_busca_promotech).
-    Retorna um dict pronto para virar linha no CSV, ou None se falhar.
+    Busca `termo_esperado` na página de busca do Buscapé (comparador de
+    preços) e extrai o menor preço encontrado ali para esse produto.
+    Diferente de coletar_preco_buscape(), a página tem vários anúncios,
+    então primeiro é preciso filtrar os que batem com o modelo esperado
+    (ver _extrair_via_busca_buscape). Retorna um dict pronto para virar
+    linha no CSV, ou None se falhar.
     """
-    loja = "Promotech (menor preço)"
+    loja = "Buscapé (menor preço)"
     try:
         resp = requests.get(url_busca, headers=HEADERS, timeout=15)
         resp.raise_for_status()
@@ -206,12 +250,12 @@ def coletar_preco_promotech_busca(url_busca, termo_esperado, modelo, debug=False
         return None
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    preco, texto_card = _extrair_via_busca_promotech(soup, termo_esperado)
+    preco, nome_anuncio = _extrair_via_busca_buscape(soup, termo_esperado, excluir_termos)
 
     if preco is None:
         print(f'[{loja}] Não encontrou preço para "{termo_esperado}" em {url_busca}.')
         if debug:
-            nome_debug = f"Promotech_{modelo}".replace(" ", "_")
+            nome_debug = f"Buscape_busca_{modelo}".replace(" ", "_")
             caminho = _salvar_debug_html(nome_debug, resp.text)
             print(f"  HTML salvo em: {caminho} — confira a estrutura para ajustar o seletor.")
         return None
@@ -221,7 +265,7 @@ def coletar_preco_promotech_busca(url_busca, termo_esperado, modelo, debug=False
         "loja": loja,
         "modelo": modelo,
         "preco": preco,
-        "titulo_produto": texto_card,
+        "titulo_produto": nome_anuncio,
         "url": url_busca,
     }
 
@@ -280,18 +324,21 @@ def coletar_todos(produtos_modelos, pausa_min=2, pausa_max=5, debug=False):
                 print(f"[OK] {modelo} — {loja}: R$ {registro['preco']:.2f}")
             time.sleep(random.uniform(pausa_min, pausa_max))
 
-        url_busca = info.get("promotech_busca_url")
-        termo_busca = info.get("promotech_busca_termo")
-        if url_busca and termo_busca:
-            registro = coletar_preco_promotech_busca(url_busca, termo_busca, modelo, debug=debug)
+        url_buscape = info.get("buscape_url")
+        if url_buscape:
+            registro = coletar_preco_buscape(url_buscape, modelo, debug=debug)
             if registro:
                 registros.append(registro)
                 print(f"[OK] {modelo} — {registro['loja']}: R$ {registro['preco']:.2f}")
             time.sleep(random.uniform(pausa_min, pausa_max))
 
-        url_buscape = info.get("buscape_url")
-        if url_buscape:
-            registro = coletar_preco_buscape(url_buscape, modelo, debug=debug)
+        url_busca_buscape = info.get("buscape_busca_url")
+        termo_busca_buscape = info.get("buscape_busca_termo")
+        if url_busca_buscape and termo_busca_buscape:
+            excluir = info.get("buscape_busca_excluir", ())
+            registro = coletar_preco_buscape_busca(
+                url_busca_buscape, termo_busca_buscape, modelo, excluir_termos=excluir, debug=debug
+            )
             if registro:
                 registros.append(registro)
                 print(f"[OK] {modelo} — {registro['loja']}: R$ {registro['preco']:.2f}")

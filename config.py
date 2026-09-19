@@ -15,20 +15,31 @@ requisições automatizadas com um desafio Cloudflare (HTTP 403,
 "Cf-Mitigated: challenge"), então nunca chega a servir o HTML com o preço.
 Não é um link quebrado; é bloqueio anti-bot deliberado do site.
 
-Nota sobre o Promotech: a página de detalhe do produto
-(`promotech_url`, mantida abaixo só como referência/link para conferência
-manual) carrega o histórico via JavaScript e não é raspável. Já a página de
-*busca* (`promotech_busca_url`) é servida com o preço em texto simples, então
-é ela quem alimenta a coleta automática — ver `coletar_preco_promotech_busca`
-em scrapers.py. O preço ali é o menor encontrado entre as lojas que o
-Promotech compara, não de uma loja fixa.
+Nota sobre o Promotech: desde setembro/2026 o site bloqueia toda requisição
+automatizada (busca, produto e até a home) com um desafio "Vercel Security
+Checkpoint" (HTTP 429, `X-Vercel-Mitigated: challenge`) — mesma categoria de
+bloqueio da Pichau, não é mais raspável. `promotech_url` fica abaixo só como
+link de referência para conferência manual (abrindo num navegador de
+verdade); a coleta automática (`coletar_todos` em scrapers.py) não usa mais
+essa chave, e a busca das GPUs no comparador foi substituída pelo Buscapé
+(ver abaixo).
 
-Nota sobre o Buscapé (PS5): diferente do Promotech, a própria página de
-produto do Buscapé (`buscape_url`) já expõe o preço via JSON-LD
-(schema.org/Product, com `offers.lowPrice`), sem precisar de página de busca
-separada nem de casar nome de card — ver `coletar_preco_buscape` em
-scrapers.py. O preço é o menor entre as lojas que o Buscapé compara para
-aquele anúncio.
+Nota sobre o Buscapé: usado de duas formas diferentes.
+- PS5 (`buscape_url`): a própria página de produto já expõe o preço via
+  JSON-LD (schema.org/Product, com `offers.lowPrice`), sem precisar de
+  página de busca nem de casar nome de anúncio — ver `coletar_preco_buscape`
+  em scrapers.py.
+- GPUs (`buscape_busca_url`/`buscape_busca_termo`/`buscape_busca_excluir`,
+  opcional): substitui a antiga busca via Promotech. A página de busca do
+  Buscapé embute os resultados como JSON dentro de um bloco
+  `<script id="__NEXT_DATA__">` (cada item com `name` e `price`), então em
+  vez de casar texto de card na marra (como era com o Promotech) o scraper
+  filtra os itens cujo nome contém todas as palavras de
+  `buscape_busca_termo` (comparação por palavra, não por posição — os nomes
+  variam entre anúncios) e nenhuma das palavras de `buscape_busca_excluir`
+  (usado para não misturar RTX 5070 Ti nos resultados da RTX 5070 comum), e
+  usa o menor preço entre os que sobrarem — ver
+  `coletar_preco_buscape_busca` em scrapers.py.
 """
 
 PRODUTOS_MODELOS = {
@@ -46,8 +57,8 @@ PRODUTOS_MODELOS = {
             "https://promotech.app.br/produtos/placa-de-video/modelo/un3ua4ft/"
             "asrock-rx-9070-xt-challenger?visao=avancada"
         ),
-        "promotech_busca_url": "https://promotech.app.br/busca?q=Rx+9070+XT",
-        "promotech_busca_termo": "ASRock RX 9070 XT Challenger",
+        "buscape_busca_url": "https://www.buscape.com.br/search?q=rx%209070%20xt",
+        "buscape_busca_termo": "ASRock RX 9070 XT Challenger",
     },
     "RTX 5070 Ti 16GB": {
         "fabricante_modelo": "MSI Shadow 3X OC",
@@ -62,8 +73,11 @@ PRODUTOS_MODELOS = {
         "promotech_url": (
             "https://promotech.app.br/produtos/placa-de-video/modelo/bdh32uxm?visao=avancada"
         ),
-        "promotech_busca_url": "https://promotech.app.br/busca?q=RTX+5070+TI",
-        "promotech_busca_termo": "MSI RTX 5070 Ti Shadow 3X OC",
+        # Busca dedicada "rtx 5070 ti" (não "rtx 5070" genérico): testada e
+        # confirmada — a busca genérica não traz o SKU MSI Shadow 3X OC Ti
+        # entre os resultados retornados pelo Buscapé.
+        "buscape_busca_url": "https://www.buscape.com.br/search?q=rtx%205070%20ti",
+        "buscape_busca_termo": "MSI RTX 5070 Ti Shadow 3X OC",
     },
     "RTX 5070 12GB": {
         # Diferente das outras duas linhas, aqui cada loja aponta para um
@@ -82,8 +96,11 @@ PRODUTOS_MODELOS = {
         "promotech_url": (
             "https://promotech.app.br/produtos/placa-de-video/modelo/k8ydt19i/pny-rtx-5070-oc"
         ),
-        "promotech_busca_url": "https://promotech.app.br/busca?q=RTX+5070",
-        "promotech_busca_termo": "PNY RTX 5070 OC",
+        # Sem SKU fixa (ver nota acima) — pega o menor preço entre qualquer
+        # RTX 5070 12GB não-Ti listada pela busca.
+        "buscape_busca_url": "https://www.buscape.com.br/search?q=rtx%205070",
+        "buscape_busca_termo": "RTX 5070",
+        "buscape_busca_excluir": ("ti",),
     },
     "PS5 Edição Digital 825GB": {
         "fabricante_modelo": "Sony (menor preço entre lojas via Buscapé)",
